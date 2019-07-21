@@ -1,0 +1,282 @@
+#!/usr/bin/env python
+
+from __future__ import (
+    absolute_import,
+    division,
+    print_function,
+    unicode_literals,
+)
+
+import argparse
+import collections
+import datetime
+import json
+import logging as _logging
+import os.path
+import plistlib
+import re
+import subprocess
+import sys
+
+logger = _logging.getLogger("macsigcheck")
+
+
+class SignatureDB(collections.MutableMapping):
+    def __init__(self, db_path, tilde_for_home_dir=None):
+        self._db_path = db_path
+        if os.path.exists(db_path):
+            logger.debug("Opening DB at %r", db_path)
+            with open(db_path, "r") as db_file:
+                self._db = json.load(
+                    db_file, object_pairs_hook=collections.OrderedDict
+                )
+        else:
+            logger.debug("New database")
+            self._db = {}
+        if tilde_for_home_dir:
+            self._home_dir = os.path.normpath(os.path.expanduser("~"))
+            self._home_dir_regexp = re.compile(
+                r"^%s(/|$)" % (re.escape(self._home_dir),)
+            )
+        else:
+            self._home_dir = self._home_dir_regexp = None
+
+    def __getitem__(self, path):
+        return self._db[path]
+
+    def __setitem__(self, path, value):
+        self._db[path] = value
+
+    def __delitem__(self, path):
+        del self._db[path]
+
+    def __iter__(self):
+        return iter(self._db)
+
+    def __len__(self):
+        return len(self._db)
+
+    def write(self):
+        logger.debug("Writing to %r", self._db_path)
+        with open(self._db_path, "w") as db_file:
+            json.dump(
+                self._db,
+                db_file,
+                sort_keys=True,
+                indent=4,
+                separators=(",", ": "),
+            )
+
+    def process_paths(self, path):
+        """Returns (expanded_path, db_path) for the given path.
+
+        expanded_path has tilde expansion performed on it.  db_path is
+        the path that should be used as the key into this database.
+
+        """
+        norm_path = os.path.normpath(path)
+        expanded_path = os.path.expanduser(norm_path)
+        possible_keys = [path, norm_path, expanded_path]
+        if self._home_dir_regexp and self._home_dir_regexp.search(norm_path):
+            tilded_path = "~%s" % (norm_path[len(self._home_dir) :],)
+            possible_keys.append(tilded_path)
+        else:
+            tilded_path = norm_path
+        for key in possible_keys:
+            if key in self._db:
+                logger.debug("%s: Found existing path %r in DB", path, key)
+                return expanded_path, key
+        else:
+            logger.debug("%s: No existing entry in DB", path)
+            return expanded_path, tilded_path
+
+
+def check_signature(path, assessment_type=None, stdout_plist=None):
+    if not assessment_type:
+        if re.search(r".*/Library/PreferencePanes/[^/]+.prefPane$", path, re.I):
+            assessment_type = "open"
+        else:
+            assessment_type = "execute"
+    cmd = [
+        "spctl",
+        "-a",
+        "-t",
+        assessment_type,
+        # I think this is only necessary for testing DMG
+        # files, but it seems harmless for the other
+        # purposes as well.
+        "--context",
+        "context:primary-signature",
+        "--raw",
+        "-vv",
+        "--ignore-cache",
+        path,
+    ]
+    logger.debug("running %r", cmd)
+    spctl = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    stdout, stderr = spctl.communicate()
+    if spctl.returncode == 0 and stdout_plist:
+        stdout = plistlib.readPlistFromString(stdout)
+    return spctl.returncode, stdout, stderr
+
+
+def do_check(db, args):
+    empty_dict = {}
+    failed = []
+    for path in args.targets or db:
+        try:
+            logger.debug("Checking %s", path)
+            expanded_path, db_key = db.process_paths(path)
+            if not os.path.exists(expanded_path):
+                if args.targets:
+                    raise Exception("%r does not exist" % (path,))
+                else:
+                    logger.debug("%s: does not exist", path)
+                    continue
+            db_entry = db.get(db_key, empty_dict)
+            originator_regexp = db_entry.get("originator")
+            if originator_regexp and originator_regexp.startswith("id:"):
+                originator_regexp = r"\(%s\)$" % (
+                    re.escape(originator_regexp[3:]),
+                )
+            spctl_status, spctl_result, spctl_stderr = check_signature(
+                expanded_path,
+                db_entry.get("assessment_type"),
+                stdout_plist=bool(originator_regexp),
+            )
+            if spctl_status != 0:
+                logger.error(
+                    "%s: spctl exited non-zero %r: %s\n",
+                    path,
+                    spctl_status,
+                    spctl_stderr,
+                )
+                failed.append(path)
+            else:
+                if originator_regexp:
+                    originator = spctl_result["assessment:originator"]
+                    if not re.search(originator_regexp, originator):
+                        logger.error(
+                            "%s: Originator %r does not match regexp %r",
+                            path,
+                            originator,
+                            originator_regexp,
+                        )
+                        failed.append(path)
+                logger.info(
+                    "%s: Verified%s",
+                    path,
+                    " including originator" if originator_regexp else "",
+                )
+        except:
+            logger.error("Error encountered while verifying %r", path)
+            raise
+    return 1 if failed else 0
+
+
+def do_update(db, args):
+    now = str(datetime.datetime.now())
+    failed = 0
+    for target in args.targets or db.iterkeys():
+        logger.debug("Starting update of %r", target)
+        expanded_target, target = db.process_paths(target)
+        if not os.path.exists(expanded_target):
+            if args.targets:
+                raise Exception("%r does not exist" % (target,))
+            else:
+                continue
+        is_new = target not in db
+        if is_new:
+            db_entry = {}
+        else:
+            db_entry = db[target]
+        spctl_status, spctl_result, spctl_stderr = check_signature(
+            expanded_target, db_entry.get("assessment_type"), True
+        )
+        if spctl_status != 0:
+            logger.error(
+                "%s: Cannot verify signature (%r): %s",
+                target,
+                spctl_status,
+                spctl_stderr,
+            )
+            failed += 1
+        else:
+            try:
+                originator = spctl_result["assessment:originator"]
+            except KeyError:
+                raise Exception(
+                    "%s: Cannot get originator from spctl" % (target,)
+                )
+            match = re.search(r"\(([A-Z0-9]+)\)$", originator)
+            if match:
+                originator = "id:%s" % (match.group(1),)
+            else:
+                originator = "^%s$" % (re.escape(originator),)
+            old_originator = db_entry.get("originator")
+            if old_originator == originator:
+                logger.info("%s: No change", target)
+            else:
+                if old_originator:
+                    logger.warn(
+                        (
+                            "%s: Originator changing from %r to %r"
+                            % (target, db_entry["originator"], originator)
+                        )
+                    )
+                db_entry["originator"] = originator
+                logger.info(
+                    "%s: %s with originator %r",
+                    target,
+                    "Created" if is_new else "Updated",
+                    originator,
+                )
+            db_entry["last_updated"] = now
+            if is_new:
+                logger.debug("%s: Adding to DB", target)
+                db[target] = db_entry
+    db.write()
+    return 1 if failed != 0 else 0
+
+
+def main(argv):
+    # Trick for allowing common switches to be either before or after
+    # a subparser command courtesy
+    # https://stackoverflow.com/a/10896737.  I expect this to break
+    # one day.
+    parser = argparse.ArgumentParser(prog=argv[0], add_help=False)
+    parser.add_argument(
+        "--db", "-D", default=os.path.expanduser("~/.macsigcheck.json")
+    )
+    parser.add_argument(
+        "--no-substitute-tilde",
+        dest="tilde_for_home_dir",
+        default=True,
+        action="store_false",
+    )
+    parser.add_argument("--verbose", "-v", default=False, action="store_true")
+    parser.add_argument("--debug", "-d", default=False, action="store_true")
+    args, remaining_argv = parser.parse_known_args(argv[1:])
+    # I didn't even expect this to work, but it does.
+    parser.add_help = True
+    subparsers = parser.add_subparsers()
+    check_parser = subparsers.add_parser("check")
+    check_parser.set_defaults(handler=do_check)
+    check_parser.add_argument("targets", nargs="*")
+    update_parser = subparsers.add_parser("update")
+    update_parser.set_defaults(handler=do_update)
+    update_parser.add_argument("targets", nargs="*")
+    parser.parse_args(remaining_argv, namespace=args)
+    if args.debug:
+        logger.setLevel(_logging.DEBUG)
+    elif args.verbose:
+        logger.setLevel(_logging.INFO)
+    db = SignatureDB(args.db, tilde_for_home_dir=args.tilde_for_home_dir)
+    return args.handler(db, args)
+
+
+if __name__ == "__main__":
+    _logging.basicConfig()
+    sys.exit(main(sys.argv))
