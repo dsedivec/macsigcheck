@@ -122,131 +122,8 @@ def check_signature(path, assessment_type=None, stdout_plist=None):
     return spctl.returncode, stdout, stderr
 
 
-def do_check(db, args):
-    empty_dict = {}
-    failed = []
-    for path in args.targets or db:
-        try:
-            logger.debug("Checking %s", path)
-            expanded_path, db_key = db.process_paths(path)
-            if not os.path.exists(expanded_path):
-                if args.targets:
-                    raise Exception("%r does not exist" % (path,))
-                else:
-                    logger.debug("%s: does not exist", path)
-                    continue
-            db_entry = db.get(db_key, empty_dict)
-            originator_regexp = db_entry.get("originator")
-            if originator_regexp and originator_regexp.startswith("id:"):
-                originator_regexp = r"\(%s\)$" % (
-                    re.escape(originator_regexp[3:]),
-                )
-            spctl_status, spctl_result, spctl_stderr = check_signature(
-                expanded_path,
-                db_entry.get("assessment_type"),
-                stdout_plist=bool(originator_regexp),
-            )
-            if spctl_status != 0:
-                logger.error(
-                    "%s: spctl exited non-zero %r: %s\n",
-                    path,
-                    spctl_status,
-                    spctl_stderr,
-                )
-                failed.append(path)
-            else:
-                if originator_regexp:
-                    originator = spctl_result["assessment:originator"]
-                    if not re.search(originator_regexp, originator):
-                        logger.error(
-                            "%s: Originator %r does not match regexp %r",
-                            path,
-                            originator,
-                            originator_regexp,
-                        )
-                        failed.append(path)
-                logger.info(
-                    "%s: Verified%s",
-                    path,
-                    " including originator" if originator_regexp else "",
-                )
-        except:
-            logger.error("Error encountered while verifying %r", path)
-            raise
-    return 1 if failed else 0
-
-
-def do_update(db, args):
-    now = str(datetime.datetime.now())
-    failed = 0
-    for target in args.targets or db.iterkeys():
-        logger.debug("Starting update of %r", target)
-        expanded_target, target = db.process_paths(target)
-        if not os.path.exists(expanded_target):
-            if args.targets:
-                raise Exception("%r does not exist" % (target,))
-            else:
-                continue
-        is_new = target not in db
-        if is_new:
-            db_entry = {}
-        else:
-            db_entry = db[target]
-        spctl_status, spctl_result, spctl_stderr = check_signature(
-            expanded_target, db_entry.get("assessment_type"), True
-        )
-        if spctl_status != 0:
-            logger.error(
-                "%s: Cannot verify signature (%r): %s",
-                target,
-                spctl_status,
-                spctl_stderr,
-            )
-            failed += 1
-        else:
-            try:
-                originator = spctl_result["assessment:originator"]
-            except KeyError:
-                raise Exception(
-                    "%s: Cannot get originator from spctl" % (target,)
-                )
-            match = re.search(r"\(([A-Z0-9]+)\)$", originator)
-            if match:
-                originator = "id:%s" % (match.group(1),)
-            else:
-                originator = "^%s$" % (re.escape(originator),)
-            old_originator = db_entry.get("originator")
-            if old_originator == originator:
-                logger.info("%s: No change", target)
-            else:
-                if old_originator:
-                    logger.warn(
-                        (
-                            "%s: Originator changing from %r to %r"
-                            % (target, db_entry["originator"], originator)
-                        )
-                    )
-                db_entry["originator"] = originator
-                logger.info(
-                    "%s: %s with originator %r",
-                    target,
-                    "Created" if is_new else "Updated",
-                    originator,
-                )
-            db_entry["last_updated"] = now
-            if is_new:
-                logger.debug("%s: Adding to DB", target)
-                db[target] = db_entry
-    db.write()
-    return 1 if failed != 0 else 0
-
-
 def main(argv):
-    # Trick for allowing common switches to be either before or after
-    # a subparser command courtesy
-    # https://stackoverflow.com/a/10896737.  I expect this to break
-    # one day.
-    parser = argparse.ArgumentParser(prog=argv[0], add_help=False)
+    parser = argparse.ArgumentParser(prog=argv[0])
     parser.add_argument(
         "--db", "-D", default=os.path.expanduser("~/.macsigcheck.json")
     )
@@ -256,25 +133,144 @@ def main(argv):
         default=True,
         action="store_false",
     )
+    parser.add_argument(
+        "--add",
+        "-a",
+        action="store_true",
+        help="""\
+            Add new targets to the DB.  Does not check existing
+            targets.""",
+    )
+    parser.add_argument(
+        "--freshen",
+        "-F",
+        action="store_true",
+        help="""\
+            Update signature information for targets already in the DB.""",
+    )
+    parser.add_argument(
+        "--update",
+        "-u",
+        action="store_true",
+        help="""\
+            Add or update signatures in the DB.  This is --add and
+            --freshen together.""",
+    )
     parser.add_argument("--verbose", "-v", default=False, action="store_true")
     parser.add_argument("--debug", "-d", default=False, action="store_true")
-    args, remaining_argv = parser.parse_known_args(argv[1:])
-    # I didn't even expect this to work, but it does.
-    parser.add_help = True
-    subparsers = parser.add_subparsers()
-    check_parser = subparsers.add_parser("check")
-    check_parser.set_defaults(handler=do_check)
-    check_parser.add_argument("targets", nargs="*")
-    update_parser = subparsers.add_parser("update")
-    update_parser.set_defaults(handler=do_update)
-    update_parser.add_argument("targets", nargs="*")
-    parser.parse_args(remaining_argv, namespace=args)
+    parser.add_argument("targets", nargs="*")
+    args = parser.parse_args(argv[1:])
     if args.debug:
         logger.setLevel(_logging.DEBUG)
     elif args.verbose:
         logger.setLevel(_logging.INFO)
+    if args.add and not args.targets:
+        raise Exception("Used --add but didn't provide targets to add")
+    if args.update:
+        if args.add or args.freshen:
+            logger.warning("--update implies both --add and --freshen")
+        args.add = args.freshen = True
     db = SignatureDB(args.db, tilde_for_home_dir=args.tilde_for_home_dir)
-    return args.handler(db, args)
+    now = str(datetime.datetime.now())
+    failed = False
+    changed = False
+    for target in args.targets or db.iterkeys():
+        logger.debug("%s: Processing", target)
+        expanded_target, target = db.process_paths(target)
+        if not os.path.exists(expanded_target):
+            if args.targets:
+                raise Exception("%r does not exist" % (target,))
+            else:
+                logger.info("%s: Does not exist, skipping", target)
+                continue
+        is_new = target not in db
+        assert not is_new or args.targets
+        if is_new and not args.add:
+            logger.error(
+                "%s: Not in DB, cannot check signature (did you forget --add?)",
+                target,
+            )
+            failed = True
+            continue
+        if is_new:
+            db_entry = {}
+        else:
+            db_entry = db[target]
+        will_write = is_new or args.freshen
+        spctl_status, spctl_result, spctl_stderr = check_signature(
+            expanded_target, db_entry.get("assessment_type"), stdout_plist=True
+        )
+        if spctl_status != 0:
+            logger.error(
+                "%s: Cannot verify signature (%r): %s",
+                target,
+                spctl_status,
+                spctl_stderr.strip(),
+            )
+            failed = True
+        else:
+            try:
+                originator = spctl_result["assessment:originator"]
+            except KeyError:
+                raise Exception(
+                    "%s: Cannot get originator from spctl" % (target,)
+                )
+            expected_originator = db_entry.get("originator")
+            if expected_originator:
+                if expected_originator.startswith("id:"):
+                    expected_originator = r"\(%s\)$" % (
+                        re.escape(expected_originator[3:]),
+                    )
+                originator_changed = not re.search(
+                    expected_originator, originator
+                )
+            else:
+                originator_changed = False
+            if will_write:
+                if expected_originator and originator_changed:
+                    logger.warn(
+                        "%s: Originator changing from %r to %r",
+                        target,
+                        db_entry["originator"],
+                        originator,
+                    )
+                if not expected_originator or originator_changed:
+                    match = re.search(r"\(([A-Z0-9]+)\)$", originator)
+                    if match:
+                        expected_originator = "id:%s" % (match.group(1),)
+                    else:
+                        expected_originator = "^%s$" % (re.escape(originator),)
+                    db_entry["originator"] = expected_originator
+                    logger.info(
+                        "%s: %s with originator %r",
+                        target,
+                        "Created" if is_new else "Updated",
+                        originator,
+                    )
+                else:
+                    logger.info("%s: No change", target)
+                db_entry["last_updated"] = now
+                changed = True
+                if is_new:
+                    logger.debug("%s: Adding to DB", target)
+                    db[target] = db_entry
+            elif originator_changed:
+                logger.error(
+                    "%s: Originator changed from %r to %r",
+                    target,
+                    expected_originator,
+                    originator,
+                )
+                failed = True
+            else:
+                logger.info(
+                    "%s: Verified%s",
+                    target,
+                    ", including originator" if expected_originator else "",
+                )
+    if changed:
+        db.write()
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
