@@ -9,6 +9,7 @@ from __future__ import (
 
 import argparse
 import collections
+import collections.abc
 import datetime
 import json
 import logging as _logging
@@ -21,7 +22,7 @@ import sys
 logger = _logging.getLogger("macsigcheck")
 
 
-class SignatureDB(collections.MutableMapping):
+class SignatureDB(collections.abc.MutableMapping):
     def __init__(self, db_path, tilde_for_home_dir=None):
         self._db_path = db_path
         if os.path.exists(db_path):
@@ -118,7 +119,7 @@ def check_signature(path, assessment_type=None, stdout_plist=None):
     )
     stdout, stderr = spctl.communicate()
     if spctl.returncode == 0 and stdout_plist:
-        stdout = plistlib.readPlistFromString(stdout)
+        stdout = plistlib.loads(stdout)
     return spctl.returncode, stdout, stderr
 
 
@@ -174,7 +175,7 @@ def main(argv):
     now = str(datetime.datetime.now())
     failed = False
     changed = False
-    for target in args.targets or db.iterkeys():
+    for target in args.targets or db.keys():
         logger.debug("%s: Processing", target)
         expanded_target, target = db.process_paths(target)
         if not os.path.exists(expanded_target):
@@ -228,7 +229,7 @@ def main(argv):
                 originator_changed = False
             if will_write:
                 if expected_originator and originator_changed:
-                    logger.warn(
+                    logger.warning(
                         "%s: Originator changing from %r to %r",
                         target,
                         db_entry["originator"],
